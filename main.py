@@ -133,23 +133,28 @@ def execute_tool(name: str, tool_input: dict, tool_log) -> str:
             return json.dumps({"error": f"Unknown tool: {name}"})
     except Exception as e:
         tool_log.error("[ERROR] %s raised: %s", name, e, exc_info=True)
+        print(f"    [!] {name} error: {e}")
         return json.dumps({"error": str(e), "tool": name})
 
 
 def print_verdict(v: dict, agent_log):
+    verdict = v.get("verdict", "UNKNOWN")
+    confidence = v.get("confidence", "Unknown")
+    evidence = v.get("evidence") or []
+    action = v.get("recommended_action", "(no action provided)")
     agent_log.info(
         "[VERDICT] verdict=%s  confidence=%s  action=%s",
-        v["verdict"], v["confidence"], defang.defang(v["recommended_action"]),
+        verdict, confidence, defang.defang(action),
     )
-    for e in v["evidence"]:
+    for e in evidence:
         agent_log.info("[VERDICT]   evidence: %s", defang.defang(e))
     print("\n" + "=" * 50)
-    print(f"VERDICT:    {v['verdict']}")
-    print(f"CONFIDENCE: {v['confidence']}")
+    print(f"VERDICT:    {verdict}")
+    print(f"CONFIDENCE: {confidence}")
     print("EVIDENCE:")
-    for e in v["evidence"]:
+    for e in evidence:
         print(f"  - {defang.defang(e)}")
-    print(f"ACTION:     {defang.defang(v['recommended_action'])}")
+    print(f"ACTION:     {defang.defang(action)}")
     print("=" * 50)
 
 
@@ -264,6 +269,15 @@ def run_chain(user_input: str):
         triage_resp.stop_reason, usage.input_tokens, usage.output_tokens, elapsed,
     )
 
+    if triage_resp.stop_reason == "max_tokens":
+        agent_log.warning("[WARN] Step 1 hit max_tokens; produce_triage_plan was not called")
+        print("WARNING: Step 1 hit max_tokens before producing a plan — re-run or increase MAX_TOKENS.")
+        return
+    if triage_resp.stop_reason not in ("tool_use", "end_turn"):
+        agent_log.warning("[WARN] Step 1 unexpected stop_reason=%r; aborting", triage_resp.stop_reason)
+        print(f"WARNING: Step 1 unexpected stop_reason={triage_resp.stop_reason!r}. Aborting.")
+        return
+
     plan = None
     for block in triage_resp.content:
         if getattr(block, "type", None) == "tool_use" and block.name == "produce_triage_plan":
@@ -274,15 +288,21 @@ def run_chain(user_input: str):
         print("WARNING: triage step did not produce a plan. Aborting.")
         return
 
+    tools_needed = plan.get("tools_needed")
+    if not isinstance(tools_needed, list):
+        agent_log.warning("[WARN] Step 1 plan missing or malformed 'tools_needed'; aborting")
+        print("WARNING: triage plan missing 'tools_needed'. Aborting.")
+        return
+
     agent_log.info("[STEP 1] plan=%s", json.dumps(plan))
-    print(f"[*] Plan: {len(plan['tools_needed'])} tool call(s)")
+    print(f"[*] Plan: {len(tools_needed)} tool call(s)")
 
     # ── Step 2: Gather ──────────────────────────────────────────────────────
     # Python executes each tool call from the plan in sequence. No API call.
     # Claude has no role here — the plan fully determines what gets run.
     print("[*] Step 2: Gather — executing tool calls")
     evidence = {}
-    for item in plan["tools_needed"]:
+    for item in tools_needed:
         tool_name = item["tool"]
         tool_input = item["input"]
         tool_log.info("[TOOL]   %s  input=%s", tool_name, json.dumps(tool_input))
@@ -291,7 +311,12 @@ def run_chain(user_input: str):
         preview = result[:150] + ("..." if len(result) > 150 else "")
         tool_log.info("[RESULT] %s  (%d chars) %s", tool_name, len(result), preview)
         print(f"    -> {preview}")
-        evidence[f"{tool_name}({json.dumps(tool_input)})"] = result
+        key = f"{tool_name}({json.dumps(tool_input)})"
+        if key in evidence:
+            agent_log.warning("[WARN] Duplicate plan entry for %s; skipping repeated call", tool_name)
+            print(f"    [!] Skipping duplicate call to {tool_name}")
+            continue
+        evidence[key] = result
 
     agent_log.info("[STEP 2] gathered %d evidence item(s)", len(evidence))
 
@@ -300,7 +325,11 @@ def run_chain(user_input: str):
     # tool_choice="any" with only submit_verdict offered forces structured output.
     print("[*] Step 3: Verdict — synthesizing evidence")
     evidence_block = "\n\n".join(f"{k}:\n{v}" for k, v in evidence.items())
-    submit_verdict_tool = next(t for t in TOOLS if t["name"] == "submit_verdict")
+    submit_verdict_tool = next((t for t in TOOLS if t["name"] == "submit_verdict"), None)
+    if submit_verdict_tool is None:
+        agent_log.error("[ERROR] submit_verdict not found in TOOLS; aborting")
+        print("ERROR: submit_verdict tool definition missing from TOOLS.")
+        return
     t0 = time.monotonic()
     verdict_resp = client.messages.create(
         model=MODEL,
@@ -325,8 +354,19 @@ def run_chain(user_input: str):
         verdict_resp.stop_reason, usage.input_tokens, usage.output_tokens, elapsed,
     )
 
+    if verdict_resp.stop_reason == "max_tokens":
+        agent_log.warning("[WARN] Step 3 hit max_tokens; submit_verdict was not called")
+        print("WARNING: Step 3 hit max_tokens before producing a verdict — re-run or increase MAX_TOKENS.")
+        return
+    if verdict_resp.stop_reason not in ("tool_use", "end_turn"):
+        agent_log.warning("[WARN] Step 3 unexpected stop_reason=%r; aborting", verdict_resp.stop_reason)
+        print(f"WARNING: Step 3 unexpected stop_reason={verdict_resp.stop_reason!r}. Aborting.")
+        return
+
     for block in verdict_resp.content:
-        if getattr(block, "type", None) == "tool_use" and block.name == "submit_verdict":
+        if getattr(block, "type", None) == "text" and block.text.strip():
+            print(f"[Claude] {block.text.strip()}")
+        elif getattr(block, "type", None) == "tool_use" and block.name == "submit_verdict":
             agent_log.info(
                 "[VERDICT] verdict=%s  confidence=%s",
                 block.input.get("verdict"), block.input.get("confidence"),
