@@ -30,27 +30,30 @@ There are no tests or linters configured.
 
 ## Architecture
 
-**Entry point:** `main.py` reads input (file arg, stdin pipe, or interactive paste) via `get_input()`, then calls `run_agent()` in the same file. All agent logic lives in `main.py`.
+**Entry point:** `main.py` reads input (file arg, stdin pipe, or interactive paste) via `get_input()`, then calls `run_chain()` in the same file. All agent logic lives in `main.py`.
 
-**Agentic loop:** `run_agent()` drives a bounded `for iteration in range(MAX_ITERATIONS)` loop calling `client.messages.create()` on each turn. The Python code is purely mechanical — it runs whatever tools Claude requests, feeds results back, and loops. All investigation strategy and verdict reasoning happen inside Claude, not in the loop. `MAX_ITERATIONS = 10` is a hard ceiling; the loop normally exits early via `return` when `submit_verdict` is called or `stop_reason == "end_turn"`.
+**Agent pattern:** `run_chain()` implements a **prompt chain** (sequential workflow): three fixed steps executed in order, each a separate `client.messages.create()` call with a scoped task. Python controls the sequence and step transitions; Claude's role is scoped per step. This contrasts with `run_agent()` (also in `main.py`) which is the original dynamic agent where Claude drives all tool calls autonomously.
 
-**Pre-extraction step:** Before the first API call, `ioc_extractor.run()` parses the raw input for URLs, IPs, domains, and email addresses. The extracted IOCs are injected into the first user message alongside the raw input so Claude starts with a structured head start rather than re-parsing text itself.
+**Pre-extraction step:** Before Step 1, `ioc_extractor.run()` parses the raw input for URLs, IPs, domains, and email addresses. The extracted IOCs are passed into every step.
 
-**Tool dispatch flow:**
-1. Claude calls `check_url_reputation` → `tools/urlscan.py` queries Spamhaus DBL + SURBL via DNS and scans the URL for suspicious keywords; returns DNSBL hit flags and keyword matches
-2. Claude calls `check_ip_reputation` → `tools/abuseipdb.py` hits ip-api.com (proxy/VPN/hosting detection) and Shodan InternetDB (open ports, vuln tags); both are keyless
-3. Claude calls `check_domain_reputation` → `tools/virustotal.py` queries Spamhaus DBL + SURBL via DNS and RDAP for domain registration age and registrar; keyless
-4. Claude calls `check_email_headers` → `tools/header_parser.py` parses SPF/DKIM/DMARC from `Authentication-Results` headers and extracts routing hops from `Received` headers; no network calls
-5. Claude calls `submit_verdict` → caught directly in the loop, not dispatched to a tool file; triggers `print_verdict()` and exits
+**Prompt chain — three steps:**
 
-**Critical agentic loop invariants** (in `run_agent()`):
-- The full `response.content` list (not just text) must be appended as the assistant message — `tool_use` blocks must be preserved so the API can match them to `tool_result` responses
-- All tool results for a single turn go back in **one** user message as a list of `{"type": "tool_result", "tool_use_id": block.id, "content": result}` dicts — `block.id` must match exactly
-- Claude may request multiple tools in a single response; all are executed before sending results back
-- `submit_verdict` is intercepted before reaching `execute_tool()` — it is a sentinel, not a real dispatch; returning immediately after calling `print_verdict()` is what exits the loop cleanly
-- `stop_reason == "max_tokens"` is non-fatal: the loop logs a warning and continues to the next iteration rather than treating it as terminal
+**Step 1 — Triage** (`prompts/triage_prompt.txt`): One API call. Claude receives the raw input and extracted IOCs. It must call `produce_triage_plan` exactly once (enforced by `tool_choice={"type": "any"}`), returning a structured list of tool calls to execute (e.g. `[{"tool": "check_url_reputation", "input": {"url": "..."}}]`). Claude decides whether email headers are present and whether to include `check_email_headers`. No tool execution happens here.
 
-**Tool definitions** (inline in `main.py` as the `TOOLS` list) are raw JSON schema dicts passed directly to `client.messages.create(tools=...)`. The descriptions are what guide Claude's tool-calling strategy. `submit_verdict` is included in `TOOLS` with an enum-constrained `verdict` field to force machine-parseable output — Claude is explicitly told in the system prompt to call it exactly once.
+**Step 2 — Gather** (no API call): Python iterates `plan["tools_needed"]` from Step 1 and calls `execute_tool()` for each item in sequence. The order and set of calls are fully determined by the Step 1 plan — Claude has no role in this step. Results accumulate in an `evidence` dict keyed by `tool_name(input)`.
+
+**Step 3 — Verdict** (`prompts/verdict_prompt.txt`): One API call. Claude receives the raw input, IOCs, and the full `evidence` block from Step 2. It must call `submit_verdict` exactly once (enforced by `tool_choice={"type": "any"}` with only `submit_verdict` offered). Python calls `print_verdict()` on the result and exits.
+
+**Tool definitions** (inline in `main.py`):
+- `TOOLS` — the four investigation tools + `submit_verdict`; used by `run_agent()` and by Step 3 (submit_verdict only)
+- `TRIAGE_TOOL` — `produce_triage_plan` schema used only in Step 1; forces Claude to output a machine-parseable plan rather than free text
+
+**Prompt files:**
+- `prompts/system_prompt.txt` — used by `run_agent()` (original dynamic agent); instructs Claude on tool-use strategy, parallelism, and verdict logic
+- `prompts/triage_prompt.txt` — used by Step 1; scoped to plan enumeration only, no reasoning
+- `prompts/verdict_prompt.txt` — used by Step 3; scoped to verdict synthesis only, no tool-use strategy
+
+**Tool dispatch** (`execute_tool()` in `main.py`): unchanged from the original. Maps tool name → function call in `tools/`. Used by both `run_agent()` and `run_chain()` Step 2.
 
 **IOC extraction** (`tools/ioc_extractor.py`):
 - Refangs common obfuscation before scanning: `hxxp://` → `http://`, `[.]` → `.`, `[@]` → `@`
@@ -66,8 +69,8 @@ There are no tests or linters configured.
 
 **Output safety** (`tools/defang.py`): `defang()` rewrites `http://` → `hxxp://`, `https://` → `hxxps://`, `.` → `[.]` before printing IOCs to the terminal. Applied in `print_verdict()` to evidence strings and the recommended action.
 
-**Logging** (`main.py`, `config.py`): each `run_agent()` call creates two timestamped log files under `logs/`:
-- `logs/agent_<YYYYMMDD_HHMMSS>.log` — agentic loop events: `[START]` with IOCs and model, `[ITER N]` with stop reason / input+output token counts / wall-clock latency, `[END]` or `[VERDICT]` at exit, `[WARN]` for max_tokens and MAX_ITERATIONS
+**Logging** (`main.py`, `config.py`): each `run_chain()` call creates two timestamped log files under `logs/`:
+- `logs/agent_<YYYYMMDD_HHMMSS>.log` — chain events: `[START]` with IOCs and model, `[STEP 1]` with triage plan + token counts + latency, `[STEP 2]` with evidence count, `[STEP 3]` with token counts + latency, `[VERDICT]` at exit, `[WARN]` on abort
 - `logs/tools_<YYYYMMDD_HHMMSS>.log` — function-level events: `[TOOL]` with full input JSON before each dispatch, `[RESULT]` with char count and 150-char preview after, `[ERROR]` with traceback on exception
 
 Both loggers use `propagate = False` and file-only handlers (no root logger involvement). Console output stays as `print()`. The `logs/` directory is gitignored.
@@ -96,17 +99,23 @@ If the tool should only be available conditionally (e.g. gated on a flag), omit 
 
 ## Where the Autonomy Lives
 
-The Python loop has no intelligence — it runs tools on demand and loops. Claude is the autonomous actor. On every iteration, Claude decides:
+In `run_chain()`, autonomy is split between Python and Claude by step:
 
-- **Which tools to call** — the system prompt instructs Claude to investigate every IOC, but the code enforces nothing; Claude chooses order and grouping
-- **Whether to call `check_email_headers`** — only if raw headers are present in the input; Claude makes this judgment from context
-- **How many tool calls to make per iteration** — the code handles any number; Claude decides when it has enough evidence
-- **When to stop** — no code tells Claude "you're done"; Claude decides when to call `submit_verdict`
-- **The verdict reasoning itself** — signal combination (DNSBL hits, domain age, IP flags, auth headers) happens in Claude's reasoning, not in Python
+**Python controls (enforced by code):**
+- Step sequence — Triage → Gather → Verdict always runs in that order
+- Which tools are offered per step — Claude cannot call investigation tools in Step 3 or `submit_verdict` in Step 1
+- Tool execution in Step 2 — Python iterates the plan and calls `execute_tool()` directly; Claude has no role
+- Step transitions — Python assembles the evidence block and constructs Step 3's input from Step 2's output
+
+**Claude decides (within each step's scope):**
+- Step 1: Which IOCs to include in the plan, whether email headers are present, what order to list tool calls
+- Step 3: The verdict itself — signal combination (DNSBL hits, domain age, IP flags, auth results), confidence level, evidence bullets, recommended action
+
+**Contrast with `run_agent()` (original dynamic agent):** the Python loop has no intelligence — it runs tools on demand and loops. Claude is the autonomous actor deciding which tools to call, whether to check email headers, how many calls to make per iteration, and when to stop. All intelligence lives inside Claude, not in the loop.
 
 ## Verdict Logic
 
-Defined entirely in `prompts/system_prompt.txt`:
+Defined in `prompts/verdict_prompt.txt` (used by `run_chain()` Step 3) and `prompts/system_prompt.txt` (used by `run_agent()`):
 
 | Verdict | Condition |
 |---------|-----------|
