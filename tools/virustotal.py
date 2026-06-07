@@ -24,7 +24,7 @@ def _check_dnsbl(domain: str, template: str) -> bool:
         socket.setdefaulttimeout(5)
         socket.gethostbyname(template.format(domain=domain))
         return True
-    except socket.gaierror:
+    except (socket.gaierror, socket.timeout):
         return False
 
 
@@ -60,7 +60,7 @@ def run(domain: str) -> str:
                     vcard = entities[0].get("vcardArray", [])
                     if len(vcard) > 1:
                         for field in vcard[1]:
-                            if field[0] == "fn":
+                            if field[0] == "fn" and len(field) > 3:
                                 registrar = field[3]
                                 break
 

@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 import anthropic
@@ -69,7 +70,9 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = open("prompts/system_prompt.txt").read()
+_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "system_prompt.txt")
+with open(_PROMPT_PATH) as _f:
+    SYSTEM_PROMPT = _f.read()
 
 
 def execute_tool(name: str, tool_input: dict, tool_log) -> str:
@@ -146,12 +149,14 @@ def run_agent(user_input: str):
                     print(block.text)
             return
 
-        if response.stop_reason == "max_tokens":
+        elif response.stop_reason == "max_tokens":
             agent_log.warning("[WARN] Response hit max_tokens on iteration %d; continuing", iteration + 1)
             print("WARNING: response hit max_tokens; continuing loop.")
+            # Must add a user turn to maintain alternating-role invariant before next API call.
+            messages.append({"role": "user", "content": "Continue."})
             continue
 
-        if response.stop_reason == "tool_use":
+        elif response.stop_reason == "tool_use":
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -171,6 +176,11 @@ def run_agent(user_input: str):
                         "content": result,
                     })
             messages.append({"role": "user", "content": tool_results})
+
+        else:
+            agent_log.warning("[WARN] Unexpected stop_reason=%r on iteration %d; aborting", response.stop_reason, iteration + 1)
+            print(f"WARNING: unexpected stop_reason={response.stop_reason!r}. Aborting.")
+            return
 
     agent_log.warning("[WARN] Hit MAX_ITERATIONS (%d) without a verdict", MAX_ITERATIONS)
     print("WARNING: hit MAX_ITERATIONS without a verdict. Review logs/ for full trace.")

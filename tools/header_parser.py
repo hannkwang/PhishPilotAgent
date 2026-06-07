@@ -23,7 +23,8 @@ def run(raw_headers: str) -> str:
 
         auth: dict = {}
         for h in msg.get_all("Authentication-Results") or []:
-            auth.update(_parse_auth(h))
+            for k, v in _parse_auth(h).items():
+                auth.setdefault(k, v)  # first (outermost MTA) header wins
 
         hops = []
         for h in msg.get_all("Received") or []:

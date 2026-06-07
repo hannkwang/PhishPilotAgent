@@ -24,7 +24,7 @@ def _check_dnsbl(domain: str, template: str) -> bool:
         socket.setdefaulttimeout(5)
         socket.gethostbyname(template.format(domain=domain))
         return True
-    except socket.gaierror:
+    except (socket.gaierror, socket.timeout):
         return False
 
 
@@ -46,13 +46,17 @@ def run(url: str) -> str:
         url_lower = url.lower()
         keyword_hits = [kw for kw in SUSPICIOUS_KEYWORDS if kw in url_lower]
 
+        parsed_host = urlparse(url).hostname or ""
+        subdomain = tldextract.extract(parsed_host).subdomain
+        subdomain_count = subdomain.count(".") + 1 if subdomain else 0
+
         return json.dumps({
             "url": url,
             "domain": domain,
             "dnsbl_hits": hits,
             "any_dnsbl_listed": any(hits.values()),
             "suspicious_keywords": keyword_hits,
-            "subdomain_count": url.count(".") - 1,
+            "subdomain_count": subdomain_count,
         })
     except Exception as e:
         return json.dumps({"error": str(e), "url": url})

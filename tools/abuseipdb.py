@@ -19,14 +19,15 @@ def run(ip: str) -> str:
         )
         shodan = shodan_resp.json() if shodan_resp.ok else {}
 
+        ipapi_ok = ipapi.get("status") == "success"
         return json.dumps({
             "ip": ip,
             "country": ipapi.get("country"),
             "isp": ipapi.get("isp"),
             "org": ipapi.get("org"),
             "asn": ipapi.get("as"),
-            "proxy_or_vpn": ipapi.get("proxy", False),
-            "hosting_or_datacenter": ipapi.get("hosting", False),
+            "proxy_or_vpn": ipapi.get("proxy") if ipapi_ok else None,
+            "hosting_or_datacenter": ipapi.get("hosting") if ipapi_ok else None,
             "open_ports": shodan.get("ports", []),
             "vulns": shodan.get("vulns", []),
             "shodan_tags": shodan.get("tags", []),
