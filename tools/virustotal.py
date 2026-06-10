@@ -1,43 +1,56 @@
 import json
-import socket
+import threading
 from typing import Optional
 from datetime import datetime, timezone
+from .dnsbl import check as dnsbl_check
 from .http import SESSION
 
-# DNS-based domain blocklist checks — keyless.
-DOMAIN_DNSBLS = [
-    ("Spamhaus_DBL", "{domain}.dbl.spamhaus.org"),
-    ("SURBL",        "{domain}.multi.surbl.org"),
-    # URIBL dropped: returns 127.0.0.1 for all queries via public DNS resolvers
-]
+# IANA RDAP bootstrap registry: maps every TLD to its RDAP server, so domain
+# age works beyond .com/.net/.org (phishing senders favor exotic TLDs).
+# Fetched once per process, ~150KB. rdap.org is avoided (Cloudflare-blocked).
+IANA_RDAP_BOOTSTRAP = "https://data.iana.org/rdap/dns.json"
 
-# RDAP servers by TLD — used instead of rdap.org (Cloudflare-blocked)
-TLD_RDAP = {
-    "com": "https://rdap.verisign.com/com/v1/domain/{domain}",
-    "net": "https://rdap.verisign.com/net/v1/domain/{domain}",
-    "org": "https://rdap.publicinterestregistry.org/rdap/domain/{domain}",
+# Fallback if the bootstrap fetch fails.
+TLD_RDAP_FALLBACK = {
+    "com": "https://rdap.verisign.com/com/v1/",
+    "net": "https://rdap.verisign.com/net/v1/",
+    "org": "https://rdap.publicinterestregistry.org/rdap/",
 }
 
+_rdap_map: Optional[dict] = None
+_rdap_lock = threading.Lock()
 
-def _check_dnsbl(domain: str, template: str) -> bool:
-    try:
-        socket.setdefaulttimeout(5)
-        socket.gethostbyname(template.format(domain=domain))
-        return True
-    except (socket.gaierror, socket.timeout):
-        return False
+
+def _rdap_servers() -> dict:
+    global _rdap_map
+    with _rdap_lock:
+        if _rdap_map is None:
+            try:
+                resp = SESSION.get(IANA_RDAP_BOOTSTRAP, timeout=10)
+                resp.raise_for_status()
+                mapping = {}
+                for tlds, servers in resp.json().get("services", []):
+                    for tld in tlds:
+                        if servers:
+                            mapping[tld.lower()] = servers[0]
+                _rdap_map = mapping
+            except Exception:
+                _rdap_map = {}
+        return _rdap_map
 
 
 def _rdap_url(domain: str) -> Optional[str]:
     parts = domain.rsplit(".", 1)
     tld = parts[1].lower() if len(parts) > 1 else ""
-    template = TLD_RDAP.get(tld)
-    return template.format(domain=domain) if template else None
+    base = _rdap_servers().get(tld) or TLD_RDAP_FALLBACK.get(tld)
+    if base:
+        return base.rstrip("/") + f"/domain/{domain}"
+    return None
 
 
 def run(domain: str) -> str:
     try:
-        hits = {name: _check_dnsbl(domain, tmpl) for name, tmpl in DOMAIN_DNSBLS}
+        hits = dnsbl_check(domain)
 
         age_days = None
         registrar = None

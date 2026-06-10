@@ -2,12 +2,20 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
+
 import anthropic
 from config import MODEL, MAX_TOKENS, MAX_ITERATIONS, check_keys, setup_loggers
-from tools import ioc_extractor, urlscan, abuseipdb, virustotal, header_parser, defang
+from tools import ioc_extractor, urlscan, abuseipdb, virustotal, header_parser, brand_check, defang
 
 check_keys()
 client = anthropic.Anthropic()
+
+# Follow-up round (Step 2b) limits: one round only, capped call count, so the
+# feedback edge cannot loop or fan out unboundedly.
+MAX_FOLLOWUP_CALLS = 5
+MAX_PARALLEL_TOOLS = 4
 
 TOOLS = [
     {
@@ -45,13 +53,22 @@ TOOLS = [
     },
     {
         "name": "check_email_headers",
-        "description": "Parse email headers for SPF, DKIM, DMARC results and routing hop analysis. Call only if raw email headers are present.",
+        "description": "Parse email headers for SPF/DKIM/DMARC results, From/Reply-To/Return-Path alignment, vendor spam scores (SCL/BCL), and routing hops. Call only if raw email headers are present. Pass {} — the runtime supplies the raw email automatically.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "raw_headers": {"type": "string", "description": "Raw email header block"}
+                "raw_headers": {"type": "string", "description": "Raw email header block (optional; supplied automatically when omitted)"}
             },
-            "required": ["raw_headers"],
+        },
+    },
+    {
+        "name": "analyze_brand_impersonation",
+        "description": "Compare the brand the email claims to be from (From display name, subject, hotlinked logo/image domains) against the actual sender domain and body link domains. Call when the input is a raw email with body content. Pass {} — the runtime supplies the raw email automatically.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "raw_email": {"type": "string", "description": "Raw email (optional; supplied automatically when omitted)"}
+            },
         },
     },
     {
@@ -69,6 +86,14 @@ TOOLS = [
         },
     },
 ]
+
+INVESTIGATION_TOOL_NAMES = {
+    "check_url_reputation",
+    "check_ip_reputation",
+    "check_domain_reputation",
+    "check_email_headers",
+    "analyze_brand_impersonation",
+}
 
 _PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "system_prompt.txt")
 with open(_PROMPT_PATH) as _f:
@@ -102,11 +127,12 @@ TRIAGE_TOOL = {
                                 "check_ip_reputation",
                                 "check_domain_reputation",
                                 "check_email_headers",
+                                "analyze_brand_impersonation",
                             ],
                         },
                         "input": {
                             "type": "object",
-                            "description": "Input parameters for the tool (e.g. {\"url\": \"https://example.com\"})",
+                            "description": "Input parameters for the tool (e.g. {\"url\": \"https://example.com\"}). Pass {} for check_email_headers and analyze_brand_impersonation.",
                         },
                     },
                     "required": ["tool", "input"],
@@ -118,7 +144,7 @@ TRIAGE_TOOL = {
 }
 
 
-def execute_tool(name: str, tool_input: dict, tool_log) -> str:
+def execute_tool(name: str, tool_input: dict, tool_log, raw_input: str = "") -> str:
     try:
         if name == "check_url_reputation":
             return urlscan.run(tool_input["url"])
@@ -127,7 +153,11 @@ def execute_tool(name: str, tool_input: dict, tool_log) -> str:
         elif name == "check_domain_reputation":
             return virustotal.run(tool_input["domain"])
         elif name == "check_email_headers":
-            return header_parser.run(tool_input["raw_headers"])
+            # The plan passes {} so it doesn't have to echo the full email
+            # back through the model; the runtime injects the raw input here.
+            return header_parser.run(tool_input.get("raw_headers") or raw_input)
+        elif name == "analyze_brand_impersonation":
+            return brand_check.run(tool_input.get("raw_email") or raw_input)
         else:
             tool_log.error("[ERROR] Unknown tool: %s", name)
             return json.dumps({"error": f"Unknown tool: {name}"})
@@ -200,6 +230,13 @@ def run_agent(user_input: str):
         elif response.stop_reason == "max_tokens":
             agent_log.warning("[WARN] Response hit max_tokens on iteration %d; continuing", iteration + 1)
             print("WARNING: response hit max_tokens; continuing loop.")
+            # A truncated turn may end mid-tool_use; the API rejects tool_use
+            # blocks without matching tool_results, so keep only text blocks.
+            text_blocks = [b for b in response.content if getattr(b, "type", None) == "text"]
+            messages[-1] = {
+                "role": "assistant",
+                "content": text_blocks or [{"type": "text", "text": "(response truncated)"}],
+            }
             # Must add a user turn to maintain alternating-role invariant before next API call.
             messages.append({"role": "user", "content": "Continue."})
             continue
@@ -214,7 +251,7 @@ def run_agent(user_input: str):
                         return
                     tool_log.info("[TOOL]   %s  input=%s", block.name, json.dumps(block.input))
                     print(f"[*] Calling {block.name}({json.dumps(block.input)})")
-                    result = execute_tool(block.name, block.input, tool_log)
+                    result = execute_tool(block.name, block.input, tool_log, user_input)
                     preview = result[:150] + ("..." if len(result) > 150 else "")
                     tool_log.info("[RESULT] %s  (%d chars) %s", block.name, len(result), preview)
                     print(f"    -> {preview}")
@@ -234,6 +271,115 @@ def run_agent(user_input: str):
     print("WARNING: hit MAX_ITERATIONS without a verdict. Review logs/ for full trace.")
 
 
+def _forced_tool_call(step_label: str, system: str, tools: list, user_content: str,
+                      want_tool: str, agent_log):
+    """Make an API call that must invoke `want_tool` (tool_choice=any).
+    Retries once with corrective feedback if the model fails to call it.
+    Returns (tool_input_or_None, last_response)."""
+    messages = [{"role": "user", "content": user_content}]
+    response = None
+    for attempt in (1, 2):
+        t0 = time.monotonic()
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=system,
+            tools=tools,
+            tool_choice={"type": "any"},
+            messages=messages,
+        )
+        elapsed = time.monotonic() - t0
+        usage = response.usage
+        agent_log.info(
+            "[%s] attempt=%d  stop_reason=%s  tokens=in:%d out:%d  latency=%.2fs",
+            step_label, attempt, response.stop_reason,
+            usage.input_tokens, usage.output_tokens, elapsed,
+        )
+        if response.stop_reason == "max_tokens":
+            agent_log.warning("[WARN] %s hit max_tokens; %s was not called", step_label, want_tool)
+            print(f"WARNING: {step_label} hit max_tokens before calling {want_tool} — re-run or increase MAX_TOKENS.")
+            return None, response
+        for block in response.content:
+            if getattr(block, "type", None) == "tool_use" and block.name == want_tool:
+                return block.input, response
+        if attempt == 1:
+            agent_log.warning("[WARN] %s did not call %s; retrying once", step_label, want_tool)
+            print(f"    [!] {step_label} did not call {want_tool}; retrying once")
+            # Reaching here means the turn contained no tool_use blocks (only
+            # offered tools can be called), so appending it as-is is safe.
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": f"You must call {want_tool} exactly once. Call it now."})
+    agent_log.warning("[WARN] %s did not call %s after retry; aborting", step_label, want_tool)
+    return None, response
+
+
+def _run_tool_calls(items: list, user_input: str, evidence: dict, executed: set,
+                    agent_log, tool_log):
+    """Validate, dedupe, and execute a batch of {"tool", "input"} items.
+    Calls run in parallel — every tool is pure network I/O. Results land in
+    `evidence` keyed by tool_name(input); `executed` tracks keys across
+    batches so the follow-up round never repeats a call."""
+    runnable = []
+    for item in items:
+        if (not isinstance(item, dict)
+                or not isinstance(item.get("tool"), str)
+                or not isinstance(item.get("input"), dict)):
+            agent_log.warning("[WARN] Skipping malformed plan item: %r", item)
+            print(f"    [!] Skipping malformed plan item: {item!r}")
+            continue
+        tool_name, tool_input = item["tool"], item["input"]
+        if tool_name not in INVESTIGATION_TOOL_NAMES:
+            agent_log.warning("[WARN] Skipping unknown tool in plan: %s", tool_name)
+            print(f"    [!] Skipping unknown tool: {tool_name}")
+            continue
+        key = f"{tool_name}({json.dumps(tool_input, sort_keys=True)})"
+        if key in executed:
+            agent_log.warning("[WARN] Duplicate plan entry for %s; skipping repeated call", tool_name)
+            print(f"    [!] Skipping duplicate call to {tool_name}")
+            continue
+        executed.add(key)
+        runnable.append((key, tool_name, tool_input))
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_TOOLS) as pool:
+        futures = []
+        for key, tool_name, tool_input in runnable:
+            tool_log.info("[TOOL]   %s  input=%s", tool_name, json.dumps(tool_input))
+            print(f"[*] Calling {tool_name}({json.dumps(tool_input)})")
+            futures.append((key, tool_name,
+                            pool.submit(execute_tool, tool_name, tool_input, tool_log, user_input)))
+        for key, tool_name, future in futures:
+            result = future.result()
+            preview = result[:150] + ("..." if len(result) > 150 else "")
+            tool_log.info("[RESULT] %s  (%d chars) %s", tool_name, len(result), preview)
+            print(f"    -> {preview}")
+            evidence[key] = result
+
+
+def _plan_followups(evidence: dict, executed: set) -> list:
+    """Step 2b: re-extract IOCs from the gathered evidence (redirect targets,
+    rDNS hostnames, etc.) and build deterministic follow-up calls for any not
+    yet checked. Shared-infrastructure domains are skipped — clean results on
+    them carry no signal. Capped at MAX_FOLLOWUP_CALLS, single round."""
+    discovered = ioc_extractor.run("\n".join(evidence.values()))
+    candidates = []
+    for url in discovered["urls"]:
+        host_domain = ioc_extractor._root_domain(urlparse(url).hostname or "")
+        if host_domain in ioc_extractor.SHARED_INFRA:
+            continue
+        candidates.append({"tool": "check_url_reputation", "input": {"url": url}})
+    for ip in discovered["ips"]:
+        candidates.append({"tool": "check_ip_reputation", "input": {"ip": ip}})
+    for domain in discovered["domains"]:
+        if domain in ioc_extractor.SHARED_INFRA:
+            continue
+        candidates.append({"tool": "check_domain_reputation", "input": {"domain": domain}})
+    pending = [
+        c for c in candidates
+        if f"{c['tool']}({json.dumps(c['input'], sort_keys=True)})" not in executed
+    ]
+    return pending[:MAX_FOLLOWUP_CALLS]
+
+
 def run_chain(user_input: str):
     agent_log, tool_log = setup_loggers()
 
@@ -246,45 +392,16 @@ def run_chain(user_input: str):
     # plan via produce_triage_plan. tool_choice="any" forces the tool call so
     # the plan is always machine-parseable rather than free text.
     print("[*] Step 1: Triage — building investigation plan")
-    t0 = time.monotonic()
-    triage_resp = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=TRIAGE_PROMPT,
-        tools=[TRIAGE_TOOL],
-        tool_choice={"type": "any"},
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Raw input:\n{user_input}\n\n"
-                f"Pre-extracted IOCs:\n{json.dumps(iocs, indent=2)}\n\n"
-                "Produce the investigation plan."
-            ),
-        }],
+    plan, _ = _forced_tool_call(
+        "STEP 1", TRIAGE_PROMPT, [TRIAGE_TOOL],
+        (
+            f"Raw input:\n{user_input}\n\n"
+            f"Pre-extracted IOCs:\n{json.dumps(iocs, indent=2)}\n\n"
+            "Produce the investigation plan."
+        ),
+        "produce_triage_plan", agent_log,
     )
-    elapsed = time.monotonic() - t0
-    usage = triage_resp.usage
-    agent_log.info(
-        "[STEP 1] stop_reason=%s  tokens=in:%d out:%d  latency=%.2fs",
-        triage_resp.stop_reason, usage.input_tokens, usage.output_tokens, elapsed,
-    )
-
-    if triage_resp.stop_reason == "max_tokens":
-        agent_log.warning("[WARN] Step 1 hit max_tokens; produce_triage_plan was not called")
-        print("WARNING: Step 1 hit max_tokens before producing a plan — re-run or increase MAX_TOKENS.")
-        return
-    if triage_resp.stop_reason not in ("tool_use", "end_turn"):
-        agent_log.warning("[WARN] Step 1 unexpected stop_reason=%r; aborting", triage_resp.stop_reason)
-        print(f"WARNING: Step 1 unexpected stop_reason={triage_resp.stop_reason!r}. Aborting.")
-        return
-
-    plan = None
-    for block in triage_resp.content:
-        if getattr(block, "type", None) == "tool_use" and block.name == "produce_triage_plan":
-            plan = block.input
-            break
     if plan is None:
-        agent_log.warning("[WARN] Step 1 did not return a triage plan; aborting")
         print("WARNING: triage step did not produce a plan. Aborting.")
         return
 
@@ -298,27 +415,23 @@ def run_chain(user_input: str):
     print(f"[*] Plan: {len(tools_needed)} tool call(s)")
 
     # ── Step 2: Gather ──────────────────────────────────────────────────────
-    # Python executes each tool call from the plan in sequence. No API call.
-    # Claude has no role here — the plan fully determines what gets run.
+    # Python executes the plan. No API call. Claude has no role here — the
+    # plan fully determines what gets run; calls execute in parallel.
     print("[*] Step 2: Gather — executing tool calls")
     evidence = {}
-    for item in tools_needed:
-        tool_name = item["tool"]
-        tool_input = item["input"]
-        tool_log.info("[TOOL]   %s  input=%s", tool_name, json.dumps(tool_input))
-        print(f"[*] Calling {tool_name}({json.dumps(tool_input)})")
-        result = execute_tool(tool_name, tool_input, tool_log)
-        preview = result[:150] + ("..." if len(result) > 150 else "")
-        tool_log.info("[RESULT] %s  (%d chars) %s", tool_name, len(result), preview)
-        print(f"    -> {preview}")
-        key = f"{tool_name}({json.dumps(tool_input)})"
-        if key in evidence:
-            agent_log.warning("[WARN] Duplicate plan entry for %s; skipping repeated call", tool_name)
-            print(f"    [!] Skipping duplicate call to {tool_name}")
-            continue
-        evidence[key] = result
-
+    executed = set()
+    _run_tool_calls(tools_needed, user_input, evidence, executed, agent_log, tool_log)
     agent_log.info("[STEP 2] gathered %d evidence item(s)", len(evidence))
+
+    # ── Step 2b: Follow-up ──────────────────────────────────────────────────
+    # Feedback edge: IOCs that only surface in tool results (redirect targets,
+    # rDNS hostnames from Shodan, hop IPs) get one bounded follow-up round.
+    # Deterministic — no API call; Python maps IOC type -> tool.
+    followups = _plan_followups(evidence, executed)
+    if followups:
+        print(f"[*] Step 2b: Follow-up — {len(followups)} new IOC(s) discovered in evidence")
+        _run_tool_calls(followups, user_input, evidence, executed, agent_log, tool_log)
+        agent_log.info("[STEP 2b] evidence now %d item(s)", len(evidence))
 
     # ── Step 3: Verdict ─────────────────────────────────────────────────────
     # Claude receives the full evidence bundle and must call submit_verdict.
@@ -330,52 +443,28 @@ def run_chain(user_input: str):
         agent_log.error("[ERROR] submit_verdict not found in TOOLS; aborting")
         print("ERROR: submit_verdict tool definition missing from TOOLS.")
         return
-    t0 = time.monotonic()
-    verdict_resp = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=VERDICT_PROMPT,
-        tools=[submit_verdict_tool],
-        tool_choice={"type": "any"},
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Raw input:\n{user_input}\n\n"
-                f"Pre-extracted IOCs:\n{json.dumps(iocs, indent=2)}\n\n"
-                f"Tool results:\n{evidence_block}\n\n"
-                "Call submit_verdict with your verdict."
-            ),
-        }],
+    verdict, verdict_resp = _forced_tool_call(
+        "STEP 3", VERDICT_PROMPT, [submit_verdict_tool],
+        (
+            f"Raw input:\n{user_input}\n\n"
+            f"Pre-extracted IOCs:\n{json.dumps(iocs, indent=2)}\n\n"
+            f"Tool results:\n{evidence_block}\n\n"
+            "Call submit_verdict with your verdict."
+        ),
+        "submit_verdict", agent_log,
     )
-    elapsed = time.monotonic() - t0
-    usage = verdict_resp.usage
-    agent_log.info(
-        "[STEP 3] stop_reason=%s  tokens=in:%d out:%d  latency=%.2fs",
-        verdict_resp.stop_reason, usage.input_tokens, usage.output_tokens, elapsed,
-    )
-
-    if verdict_resp.stop_reason == "max_tokens":
-        agent_log.warning("[WARN] Step 3 hit max_tokens; submit_verdict was not called")
-        print("WARNING: Step 3 hit max_tokens before producing a verdict — re-run or increase MAX_TOKENS.")
-        return
-    if verdict_resp.stop_reason not in ("tool_use", "end_turn"):
-        agent_log.warning("[WARN] Step 3 unexpected stop_reason=%r; aborting", verdict_resp.stop_reason)
-        print(f"WARNING: Step 3 unexpected stop_reason={verdict_resp.stop_reason!r}. Aborting.")
+    if verdict is None:
+        print("WARNING: verdict step did not produce a verdict. Review logs/ for full trace.")
         return
 
     for block in verdict_resp.content:
         if getattr(block, "type", None) == "text" and block.text.strip():
             print(f"[Claude] {block.text.strip()}")
-        elif getattr(block, "type", None) == "tool_use" and block.name == "submit_verdict":
-            agent_log.info(
-                "[VERDICT] verdict=%s  confidence=%s",
-                block.input.get("verdict"), block.input.get("confidence"),
-            )
-            print_verdict(block.input, agent_log)
-            return
-
-    agent_log.warning("[WARN] Step 3 did not call submit_verdict")
-    print("WARNING: verdict step did not produce a verdict. Review logs/ for full trace.")
+    agent_log.info(
+        "[VERDICT] verdict=%s  confidence=%s",
+        verdict.get("verdict"), verdict.get("confidence"),
+    )
+    print_verdict(verdict, agent_log)
 
 
 def get_input() -> str:
